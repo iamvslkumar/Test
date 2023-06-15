@@ -1,18 +1,28 @@
-package com.practice.test;
+import React, { useState } from 'react';
 
-//A simple enum example where enum is declared
-//outside any class (Note enum keyword instead of
-//class keyword)
-enum Color
-{
- RED, GREEN, BLUE;
-}
-public class Test {
+const Popup = () => {
+  const [isOpen, setIsOpen] = useState(false);
 
-	public static void main(String[] args){
-		
-		
-		Color c1 = Color.BLUE;
-        System.out.println(c1);
-	}
-}
+  const openPopup = () => {
+    setIsOpen(true);
+  };
+
+  const closePopup = () => {
+    setIsOpen(false);
+  };
+
+  return (
+    <div>
+      <button onClick={openPopup}>Open Pop-up</button>
+      {isOpen && (
+        <div className="popup">
+          <h2>This is a Pop-up Box</h2>
+          <p>Hello, this is some sample text inside the pop-up box!</p>
+          <button onClick={closePopup}>Close</button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default Popup;
