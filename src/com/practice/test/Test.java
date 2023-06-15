@@ -17,6 +17,7 @@ const CreateJiraTicket = () => {
     const axiosInstance = axios.create({
       baseURL: "https://your-jira-server.com/rest/api/2/",
       headers: {
+        "Access-Control-Allow-Origin": "*",
         Authorization: `Basic ${btoa(jiraCredentials.username + ":" + jiraCredentials.password)}`,
       },
     });
