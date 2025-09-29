@@ -424,3 +424,76 @@ Dead-letter discipline: all failures are routed to DL sinks with rich metadata (
 
 Schema evolution strategy: when deserialization DL spikes occur, introduce a compatible schema, replay DL items after migration, and then retire old schemas.
 
+
+
+
+
+
+flowchart TD
+  %% =========================
+  %% Triggers
+  %% =========================
+  subgraph Triggers
+    T1[Trigger A - Scheduled batch replay (time-based)]
+    T2[Trigger B - Manual on-demand replay (human-initiated)]
+  end
+
+  %% =========================
+  %% Sources
+  %% =========================
+  subgraph Sources
+    DLQ[(DLQ source - Table / Queue / Topic)]
+    JOB[(LOOKUP_TRANSACTION_EVENT)]
+  end
+
+  %% =========================
+  %% Main Flow
+  %% =========================
+  subgraph Main_Flow
+    A[1. Read from DLQ by event id]
+    B[2. Lookup raw_event in LOOKUP_TRANSACTION_EVENT by event id]
+    C[3. Build replay payload from raw_event]
+    D{4. Classify error type}
+    E[5a. Manual review queue - status needs attention]
+    F[5b. Auto retry candidate - transient infra]
+    G[5c. Apply fixers - set defaults or mappings]
+    Q[6. Mark retry scheduled and set next attempt time]
+    H[7. Re-publish to original topic with reprocess flag]
+    I[8. Idempotency check by event id or job id]
+    J[9. Normal pipeline consumes again]
+    K{10. Success decision}
+    L[11. Mark resolved - update LOOKUP_TRANSACTION_EVENT and DLQ source]
+    M[12. Increment attempt - keep in DLQ or mark final failed]
+  end
+
+  %% =========================
+  %% Trigger start
+  %% =========================
+  T1 --> A
+  T2 --> A
+
+  %% =========================
+  %% Flow with sources
+  %% =========================
+  DLQ --> A
+  A --> B
+  B -->|select raw_event by id| JOB
+  B --> C
+
+  C --> D
+  D -->|deserialization or schema| E
+  D -->|transient infra (429/502/503/504/timeout)| F
+  D -->|business validation - fixable| G
+
+  F --> Q
+  G --> H
+  E -.->|operator decides| T2
+
+  Q --> H
+  H --> I
+  I --> J
+  J --> K
+  K -->|yes| L
+  K -->|no| M
+
+
