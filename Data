@@ -370,3 +370,57 @@ flowchart TD
 
 
 
+A) Handling at Consuming Time (Kafka → Service)
+
+When consuming events, the system must guarantee durability and protect the pipeline from poison messages.
+
+Failures can occur during deserialization (bad schema, corrupt payload) or within the consumer loop itself (rebalance storms, broker hiccups, auth issues).
+
+To avoid losing events, offsets are committed only after the event has been processed and persisted (enable.auto.commit=false).
+
+If a payload cannot be deserialized, it is directly diverted to the DL sink (DLT/DLQ/DL_TABLE) without retries, preventing one bad message from stalling partitions.
+
+When downstream systems (e.g., DB or APIs) slow down, the consumer can apply backpressure by reducing batch sizes or pausing partitions, ensuring system stability.
+
+Recovery for these cases is either automatic (Kafka re-delivery after restart) or via DLQ replay for permanently malformed records.
+
+B) Handling at API Calls (Enrichment: API-1 → API-2 → API-3)
+
+The enrichment phase is most error-prone since it depends on external systems. The design ensures retries are bounded, failures are classified, and state is checkpointed.
+
+Transient infra issues (HTTP 429, 5xx, timeouts, connection resets, DNS/TLS failures) are retried with exponential backoff and jitter. Circuit breakers prevent overloading sick dependencies.
+
+Each API call is followed by a checkpoint in the LOOKUP_TRANSACTION_EVENT table. This way, after a crash, the service resumes from the last successful step instead of re-calling all APIs.
+
+Validation errors (e.g., missing optional fields, legacy mismatches) can optionally be auto-fixed by applying default values or mappings, with the fix recorded for audit.
+
+Exhausted retries or non-fixable errors result in marking the job FAILED in LTE and sending the event to the dead-letter sink. This ensures the hot path continues flowing without blocking.
+
+During reprocessing, the system retrieves the authoritative raw_event from LTE, not from DLQ payloads, guaranteeing deterministic replays.
+
+C) Handling at Commit & Publish (DB Tx → Outbox → Kafka)
+
+The final step is to persist results and publish the enriched event, ensuring atomicity and resilience against publishing errors.
+
+Transactional Outbox ensures that updating the job record (marking COMPLETE) and queuing the message for publish happen in a single DB transaction. This prevents “phantom publishes” where state changes but the event never goes out—or vice versa.
+
+Offsets are acknowledged only after the transaction commits, so no message is lost even during service crashes.
+
+The Outbox Poller asynchronously reads pending entries, publishes with an idempotent Kafka producer, and marks them SENT. If the publish fails (broker down, network error), the poller retries later with backoff.
+
+If outbox rows accumulate, the poller can scale horizontally, fetching in batches and replaying events safely because the producer deduplicates via Kafka’s idempotence.
+
+D) Cross-Phase Controls
+
+Certain design principles apply across all phases to make the pipeline resilient and replayable:
+
+Idempotency by event_id: all phases use event_id (and optionally job_id) as the dedupe key, making retries safe across consumption, API calls, and publishing.
+
+Per-key serialization: partitioning by key ensures events for the same entity are processed sequentially, avoiding interleaving during retries or replays.
+
+Backoff everywhere: exponential backoff with jitter is applied at consumption retries, API calls, outbox publish retries, and DLQ replays, preventing retry storms.
+
+Dead-letter discipline: all failures are routed to DL sinks with rich metadata (event id, error type, error code, attempt count, timestamps) to make triage and replay deterministic.
+
+Schema evolution strategy: when deserialization DL spikes occur, introduce a compatible schema, replay DL items after migration, and then retire old schemas.
+
