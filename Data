@@ -1,0 +1,372 @@
+Absolutely—here’s a **much more detailed** write-up you can drop into your design doc. I keep it in **paragraphs + short bullet points** (not pros/cons tables), and I tie every choice back to the two diagrams you shared.
+
+---
+
+# Main Enrichment Flow (Kafka → APIs → Outbox → Publish)
+
+This pipeline ingests raw events from Kafka, enriches them via one or more upstream APIs, persists stepwise progress for resumability, and publishes a final enriched event. The design biases toward **correctness, replayability, and bounded failure blast radius**.
+
+## Ingest: consumer, retries, and poison messages
+
+The consumer runs with **manual acks**, so offsets are committed only after durable state transitions are recorded. That means a crash before the DB transaction simply replays the same event, which is safe because we enforce idempotency by `event_id`.
+
+* **Kafka consumer settings**
+
+  * `enable.auto.commit=false`; commit only after the DB transaction completes.
+  * Partitioning: choose a key that enforces business ordering (often `accountId` / `customerId` / `event_id`).
+  * Batching: small batches minimize lock contention but increase commit overhead; start with 32–128 records per poll.
+* **Retryable topic for transient failures**
+
+  * Use a retry/delay topic pattern (or Spring’s `@RetryableTopic`) with exponential backoff (e.g., 1m, 5m, 15m, 1h).
+  * Prevents blocking the hot path when an upstream API is flaky or rate-limited.
+* **Poison pill handling**
+
+  * Messages that fail deserialization or schema validation are shunted out early to the **dead-letter sink** to avoid crashing consumers.
+  * Attach rich headers (parse result, error code, offset, partition, first-seen timestamp) for faster triage.
+
+## Idempotency and job state: Redis + LOOKUP_TRANSACTION_EVENT
+
+We do a fast idempotency check in Redis, and we persist authoritative state in **`LOOKUP_TRANSACTION_EVENT`** (LTE). Redis is for speed; LTE is for truth and replay.
+
+* **Redis**
+
+  * Key: `idem:<event_id>` (or a composite key that matches your dedupe boundary).
+  * Value: minimal (e.g., last processed status or a tombstone).
+  * TTL: align to your longest possible replay window (e.g., 14–30 days); refresh on successful publish.
+* **`LOOKUP_TRANSACTION_EVENT` table**
+
+  * Stores raw event, current status, and per-step checkpoints so the service can **resume mid-flow**.
+  * **Recommended columns**
+
+    * `event_id` (PK or unique), `status` (IN_PROGRESS, FAILED, COMPLETE)
+    * `raw_event` (JSON/BLOB), `api1_result`, `api2_result`, `api3_result`
+    * `last_error_type`, `last_error_code`, `attempt_count`
+    * `created_at`, `updated_at`, optional `trace_id`/`correlation_id`
+  * **Indexes**
+
+    * `idx_lte_event_id` (unique), `idx_lte_status_updated_at` (operational queries), optional `idx_lte_last_error_code`.
+
+## Orchestration and enrichment: stepwise with checkpoints
+
+The service executes **API-1 → checkpoint → API-2 → checkpoint → API-3 (optional) → build enriched payload**. Persisting after each step ensures that restarts never re-call already successful steps.
+
+* **Resilience patterns on each call**
+
+  * **Rate limiter** (global and per-host), **timeout per call**, **retry with jitter**, **circuit breaker** to shed load on persistent failures.
+  * **Retryable error catalog** (tie this to your diagram R1):
+    `429, 502, 503, 504, connection timeout, socket timeout, connection reset, no http response, temporary dns failure, tls handshake timeout, transient io/resource timeout`.
+* **Checkpoint content**
+
+  * Persist input+output summaries (IDs, version, hashes) rather than huge bodies where possible.
+  * Store any **idempotency keys** used with upstreams so replays won’t create side effects there.
+
+## Failure routing: DL sink for any exhausted API
+
+If API-1/2/3 cannot succeed after bounded retries/backoff, the job is set to **FAILED** and the event is sent to a **dead-letter sink** (you’ve modeled this as **DLT / DLQ / DL_TABLE**). This isolates bad records from the hot path and preserves them for controlled recovery.
+
+* **Attach headers to DL sink**
+
+  * `x-event-id`, `x-original-topic/partition/offset`, `x-error-type`, `x-error-code`, `x-attempt-count`, timestamps.
+* **Operational guardrails**
+
+  * Measure DL rate and age; if DL inflow spikes, scale workers or reduce hot-path pull rate.
+
+## Transactional Outbox and offset acks
+
+We apply the **transactional outbox** pattern: the same DB transaction that marks LTE COMPLETE also **inserts a pending outbox row**. Only after that transaction commits do we **ack the Kafka offset**.
+
+* **Outbox schema (suggested)**
+
+  * `outbox_id` (PK), `event_id` (FK to LTE), `topic_name`, `key`, `payload`, `headers`, `status` (PENDING, SENT), `retry_count`, `next_attempt_at`, timestamps.
+* **Outbox poller**
+
+  * Pulls PENDING rows in small batches (e.g., 100–500), publishes with an **idempotent producer**, and marks SENT on success.
+  * Respect per-key ordering: sort by `created_at` or maintain `(topic, key)` sequence numbers if strict ordering is critical.
+
+## Asynchronous publish: idempotent producer
+
+The producer uses Kafka’s idempotence so duplicate sends (due to poller or network retries) don’t create duplicate records on the topic. This gets you **effectively once** publish semantics when combined with DB-backed outbox.
+
+* **Payload on publish**
+
+  * Include `event_id`, **step hashes or version tags**, and a clear **schema version** for the enriched event.
+  * Consider adding `reprocess=true` header for any replayed message (from the second diagram).
+
+---
+
+# Reprocessing from DLQ (Table / Queue / Topic)
+
+This recovery pipeline ensures **every failed event can be deterministically retried** using the **authoritative raw event** stored in LTE. Triggers live at the top to make it explicit that **no replay happens unless scheduled or invoked**.
+
+## Triggers: scheduled and manual
+
+Two trigger types balance automation and control.
+
+* **Scheduled batch replay**
+
+  * Cron (e.g., every 5–10 min) that selects due DL records or LTE rows with `status=FAILED` and an eligible `next_attempt_at`.
+  * Exponential backoff matrix (example): `1m → 5m → 15m → 1h → 3h → 6h → 12h`, then cap at `N` attempts.
+  * Throttles via a global rate limiter and **per-key serialization** (only one in-flight per `event_id`).
+* **Manual on-demand replay**
+
+  * Ops UI/CLI filters (e.g., error_code=503 and last_failed>now-2h), selects a set, and flips them to `RETRY_SCHEDULED`.
+  * Always record in a `replay_audit` table (`replay_id`, `event_id`, who/when/why).
+
+## DLQ source abstraction
+
+Your design allows DL as **Table**, **Queue**, or **Topic**. Keep the integration narrow:
+
+* **DL_TABLE path**
+
+  * `dlq_event(event_id, error_type, error_code, payload_snapshot, attempt_count, status, first_seen_ts, last_updated_ts, ...)`.
+  * Great for queries and audits; simple joins to LTE.
+* **DLT / DLQ path**
+
+  * Kafka topic for failed messages; use a **DLQ worker** to ingest into `dlq_event` for uniform handling.
+
+## Lookup and rebuild from LOOKUP_TRANSACTION_EVENT
+
+Replay starts by fetching the **raw_event** for the `event_id` from LTE, not from the DL payload. This guarantees payload consistency and isolates DL formatting from source-of-truth data.
+
+* **When LTE holds raw_event**
+
+  * Store raw payload as JSON/BLOB; consider compression for large messages.
+  * Optional: **content hash** column for detecting payload mutations.
+* **If LTE doesn’t have raw_event (edge case)**
+
+  * Fall back to DL payload snapshot and mark replay as **best-effort** in the audit log.
+
+## Classification and next actions
+
+A single classification step governs the replay decision:
+
+* **Deserialization or schema issues**
+
+  * Routed to **manual review**; often requires a schema migration or a corrective patch.
+* **Transient infra**
+
+  * Mark **RETRY_SCHEDULED** with backoff; these are the catalog errors you listed (429/502/503/504, timeouts, DNS/TLS transient, resets).
+* **Fixable business validation**
+
+  * Apply **deterministic fixers** (e.g., map legacy field names, default optional fields, minor sanitization). All changes are appended to `replay_audit.notes` as a JSON patch log.
+
+## Queueing and re-publish
+
+When an item is scheduled, set `next_attempt_at` and **increment attempts**; the replay worker picks it when due. Re-publishing goes to the **original topic** with the original key, plus a header like `reprocess=true`.
+
+* **Idempotency on replays**
+
+  * Check LTE by `event_id` and last successful checkpoint; if the job is COMPLETE, **drop replay**.
+  * For in-flight duplicates, enforce **per-event lock** (Redis SETNX or DB “lease” column with timestamp).
+
+## Success and terminal failure
+
+After re-publish, the main pipeline consumes it again. If successful, **mark RESOLVED** in both LTE and DL (or DLQ table). If it fails again and exceeds max attempts, mark **FINAL_FAILED** and alert the owning team.
+
+* **Resolution updates**
+
+  * LTE: `status=COMPLETE`, `attempt_count`, clear `last_error_*`.
+  * DL: `status=RESOLVED` (or `FINAL_FAILED`), link to `replay_id`.
+* **SLO hints**
+
+  * Track **time-to-resolve** and **age in DL**. Trigger alerts if oldest DL item age breaches a threshold (e.g., 30–60 min in business hours).
+
+---
+
+# Data Model Reference (suggested)
+
+**`LOOKUP_TRANSACTION_EVENT`**
+
+* `event_id` (PK/unique), `status` enum, `raw_event` JSON/BLOB
+* `api1_result` JSON (nullable), `api2_result` JSON, `api3_result` JSON
+* `attempt_count` int, `last_error_type` varchar, `last_error_code` varchar
+* `created_at`, `updated_at`, optional `trace_id`/`correlation_id`
+* Indexes: `(event_id) unique`, `(status, updated_at)`, `(last_error_code, updated_at)`
+
+**`outbox`**
+
+* `outbox_id` PK, `event_id` FK, `topic_name`, `key`, `payload`, `headers` JSON
+* `status` enum (PENDING, SENT), `retry_count` int, `next_attempt_at` ts
+* Indexes: `(status, next_attempt_at)`, `(event_id)`
+
+**`dlq_event`** (if using DL table)
+
+* `dlq_id` PK, `event_id`, `error_type`, `error_code`, `payload_snapshot` JSON
+* `attempt_count` int, `status` enum (NEEDS_ATTENTION, RETRY_SCHEDULED, RESOLVED, FINAL_FAILED)
+* `first_seen_ts`, `last_updated_ts`
+* Indexes: `(status, last_updated_ts)`, `(error_code, last_updated_ts)`, `(event_id)`
+
+**`replay_audit`**
+
+* `replay_id` PK, `event_id`, `actor` (AUTO or USER:name), `notes` JSON, `replay_ts` ts
+* Index: `(event_id, replay_ts)`
+
+---
+
+# Backoff, Concurrency, and Ordering
+
+* **Backoff**
+  Use exponential with jitter; cap attempts (e.g., 7–8). Differentiate **fast** (API timeouts) vs **slow** (upstream outages) ladders.
+* **Per-key serialization**
+  Only one active job per `event_id`. Enforce with:
+
+  * Kafka partitioning by `event_id` (consumers already serialized per partition), and
+  * A **per-event lock** in Redis/DB for replay workers so you don’t race with the hot path.
+* **Global rate limits**
+  Shape replay QPS so it cannot starve the hot path or overload upstream APIs.
+
+---
+
+# Operational Notes (what your runbook should say)
+
+* **When DL inflow spikes**: slow down hot-path consumption, scale out API clients, or raise backoff.
+* **When outbox backlog grows**: investigate producer errors; check broker availability; verify poller liveness and `next_attempt_at`.
+* **When LTE grows too large**: implement TTL/archive (e.g., move COMPLETE >90d to cold storage), keep hot indexes small.
+* **Blue-green upgrades**: keep schema evolution backward-compatible; deploy fixers alongside producer schema bumps; test replays in a canary environment.
+
+
+---
+
+# Why this shape works
+
+* It **never loses events** (manual acks + outbox) and **never double-applies effects** (idempotency by `event_id` + idempotent producer).
+* It **recovers gracefully** (per-step checkpoints, DL replay with isolation).
+* It **scales predictably** (partitioning by key, bounded retries, global rate limits).
+* It is **auditable** (LTE + DL tables + replay audit), which is crucial in financial and enterprise domains.
+
+
+
+
+flowchart TD
+  %% ===== Top-down concise flow with numbered activities and DB calls =====
+
+  %% Ingest
+  A1[1. Kafka consumer - topic raw - manual ack]
+  A1a[1a. Retryable topic - non blocking retries]
+  A1b[1b. Poison pill handler - error deserializer]
+  A1 -. processing error .-> A1a
+  A1 -. deserialization error .-> A1b
+
+  %% Idempotency and job state
+  B1[2. Idempotency check - Redis get by key]
+  DB1[(table LOOKUP_TRANSACTION_EVENT)]
+  B1 -->|select by event key| DB1
+  B2[3. Upsert job - LOOKUP_TRANSACTION_EVENT]
+  B2 -->|insert or update| DB1
+
+  %% Enrichment calls
+  C1[4. API 1 call]
+  C2[5. Checkpoint API 1 - update LOOKUP_TRANSACTION_EVENT]
+  C2 -->|update| DB1
+
+  C3[6. API 2 call]
+  C4[7. Checkpoint API 2 - update LOOKUP_TRANSACTION_EVENT]
+  C4 -->|update| DB1
+
+  C5[8. API 3 call - optional]
+  C6[9. Build enriched payload]
+
+  %% Failure policies
+  D1[Policy - API 1 or 2 failure - mark failed - send to DLQ]
+  D3[Policy - API 3 failure - mark failed - send to DLQ]
+  DL[Dead letter sink - DLT or DLQ or DL_TABLE]
+
+  %% Transactional commit and outbox
+  DB2[(table outbox)]
+  E1[10. Atomic db transaction - update LOOKUP_TRANSACTION_EVENT and insert outbox]
+  E1 -->|update| DB1
+  E1 -->|insert| DB2
+  E2[11. Ack kafka offset only after transaction success]
+
+  %% Async publish
+  F1[12. Outbox poller - batch ordered fetch]
+  F1 -->|select pending| DB2
+  F2[13. Kafka producer - topic enriched - idempotent]
+
+  %% Retryable errors catalog for APIs
+  R1{{Retryable errors examples
+  http 429 too many requests
+  http 502 bad gateway
+  http 503 service unavailable
+  http 504 gateway timeout
+  connection timeout
+  socket timeout
+  connection reset by peer
+  no http response
+  temporary dns failure
+  tls handshake timeout
+  io exception transient
+  resource access timeout}}
+
+  %% Main top down flow
+  A1 --> B1 --> B2 --> C1 --> C2 --> C3 --> C4 --> C5 --> C6 --> E1 --> E2 --> F1 --> F2
+
+  %% Error and policy links
+  C1 -. on failure .-> D1
+  C3 -. on failure .-> D1
+  C5 -. on failure .-> D3
+  D1 -. route to DLQ .-> DL
+  D3 -. route to DLQ .-> DL
+  A1a -. redelivery after delay .-> A1
+
+  %% Attach retryable error catalog to each API call
+  C1 -. refer .-> R1
+  C3 -. refer .-> R1
+  C5 -. refer .-> R1
+
+
+
+flowchart TD
+  %% Triggers
+  T1[Trigger A - Scheduled batch replay time based]
+  T2[Trigger B - Manual on demand replay human initiated]
+
+  %% Sources
+  DLQ[(DLQ source - can be Table or Queue or Topic)]
+  JOB[(table LOOKUP_TRANSACTION_EVENT)]
+
+  %% Main flow
+  A[1. Read from DLQ by event id]
+  B[2. Lookup raw_event in LOOKUP_TRANSACTION_EVENT by event id]
+  C[3. Build replay payload from raw_event]
+  D{4. Classify error type}
+  E[5a. Manual review queue status needs attention]
+  F[5b. Auto retry candidate transient infra]
+  G[5c. Apply fixers set defaults or mappings]
+  Q[6. Mark retry scheduled and set next attempt time]
+  H[7. Re publish to original topic with reprocess flag]
+  I[8. Idempotency check by event id or job id]
+  J[9. Normal pipeline consumes again]
+  K{10. Success decision}
+  L[11. Mark resolved update LOOKUP_TRANSACTION_EVENT and DLQ source]
+  M[12. Increment attempt keep in DLQ or mark final failed]
+
+  %% Trigger start
+  T1 --> A
+  T2 --> A
+
+  %% Flow with sources
+  DLQ --> A
+  A --> B
+  B --> JOB
+  B --> C
+
+  C --> D
+  D -- deserialization or schema --> E
+  D -- transient infra like 429 502 503 504 or timeout --> F
+  D -- business validation fixable --> G
+
+  F --> Q
+  G --> H
+  E -. operator decides .-> T2
+
+  Q --> H
+  H --> I --> J --> K
+  K -- yes --> L
+  K -- no --> M
+
+
+
+
+
+
